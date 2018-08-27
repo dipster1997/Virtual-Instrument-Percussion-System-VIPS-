@@ -1,0 +1,361 @@
+
+#include "vips.h"
+
+#include <stdio.h>
+#include <time.h>
+#include <Elementary.h>
+#include <player.h>
+#include <storage.h>
+#include <app.h>
+#include <dlog.h>
+#include <sensor.h> //Library for the sensor usage
+
+//interval in millisecond for accelerometer
+#define af_interval 10// 2-->500HZ, 3-->333HZ, 4-->250HZ, 5-->200HZ 10-->100HZ
+//interval in millisecond for gyroscope
+#define gf_interval 5
+
+//movements predicted counter
+static int movment_counter=0;
+//prediction factor
+static float prediciton_factor = 35;
+
+//min duration for a movement ms
+static float release_time= 170;//waiting time for a gesture to be completed and then counted
+//last move time stamp m
+static float last_timestamp=0;
+
+
+static void
+start_gyroscope_sensor(appdata_s *ad,int gf){
+	sensor_error_e err = SENSOR_ERROR_NONE;
+	sensor_get_default_sensor(SENSOR_GYROSCOPE, &sensor_info_gyro.sensor);
+	err = sensor_create_listener(sensor_info_gyro.sensor, &sensor_info_gyro.sensor_listener);
+	sensor_listener_set_event_cb(sensor_info_gyro.sensor_listener, gf, _new_sensor_value, ad);
+	sensor_listener_start(sensor_info_gyro.sensor_listener);
+}
+
+
+static void
+stop_gyroscope_sensor(appdata_s *ad){
+	sensor_listener_stop(sensor_info_gyro.sensor_listener);
+}
+
+struct appdata {
+    Evas_Object *win;
+    Evas_Object *conform;
+    Evas_Object *label0; /* Whether the accelerator sensor is supported */
+    Evas_Object *label1; /* Current acceleration value */
+    Evas_Object *label2; /* Maximum acceleration value */
+    player_h player;
+};
+typedef struct appdata appdata_s;
+
+struct _sensor_info {
+    sensor_h sensor; /* Sensor handle */
+    sensor_listener_h sensor_listener; /* Sensor listener */
+};
+
+typedef struct _sensor_info sensorinfo_s;
+
+static sensorinfo_s sensor_info;//for acceleormeter but will not be used
+static sensorinfo_s sensor_info_gyro;//for gyroscope
+
+static void
+win_delete_request_cb(void *data, Evas_Object *obj, void *event_info)
+{
+	ui_app_exit();
+}
+
+static void
+win_back_cb(void *data, Evas_Object *obj, void *event_info)
+{
+	appdata_s *ad = data;
+	/* Let window go to hide state. */
+	elm_win_lower(ad->win);
+}
+
+
+
+/**
+ * Shows if the sensor is supported and display the result in label0
+ */
+static void
+show_is_supported(appdata_s *ad)
+{
+    char buf[PATH_MAX];
+    bool is_supported = false;
+    //sensor_is_supported(SENSOR_ACCELEROMETER, &is_supported);
+    sensor_is_supported(SENSOR_GYROSCOPE, &is_supported);
+    sprintf(buf, "Gyroscope sensor", is_supported ? "support" : "not support");
+    elm_object_text_set(ad->label0, buf);
+}
+
+/**
+ * Add a UI component
+ */
+static void
+my_box_pack(Evas_Object *box, Evas_Object *child,
+            double h_weight, double v_weight, double h_align, double v_align)
+{
+    /* Tell the child packed into the box to be able to expand */
+    //evas_object_size_hint_weight_set(child, h_weight, v_weight);
+    /* Fill the expanded area (above) as opposed to centering in it */
+    evas_object_size_hint_align_set(child, h_align, v_align);
+    /* Set the child as the box content and show it */
+    evas_object_show(child);
+    elm_object_content_set(box, child);
+    /* Put the child into the box */
+    elm_box_pack_end(box, child);
+    /* Show the box */
+    evas_object_show(box);
+}
+
+/**
+ * the callback from gyroscope
+ */
+static void
+_new_sensor_value(sensor_h sensor, sensor_event_s *sensor_data, void *user_data)
+{
+	float current_z=sensor_data->values[2];//extracting the Z gyroscope data
+
+    if (sensor_data->value_count < 3)//sensor not working correctly
+        return;
+
+    char buf[PATH_MAX];
+    appdata_s *ad = (appdata_s*)user_data;
+    sprintf(buf, "X : %0.1f / Y : %0.1f / Z : %0.1f",
+             sensor_data->values[0], sensor_data->values[1], sensor_data->values[2]);
+
+    //set the label text
+    elm_object_text_set(ad->label1, buf);
+
+    //update the derivative
+   	d_gz=current_z-last_z;
+
+   	//slope prediction
+    if(current_z>0 && d_gz>prediciton_factor && ((last_timestamp+release_time)<get_current_millis()))
+    {//current_z>0 is done to check when the hand is moving downward and a positve angular velocity is generated
+    	// when the hand makes a hit of medium or hard intensity, the prediction factor touches atleast 35.
+    	//release time is according to how long a standard hit takes time to be made
+    	last_timestamp=get_current_millis();
+    	player_start(ad->player);
+        movment_counter++;
+    }
+    else{
+    	sprintf(buf, "X :%d ",movment_counter);
+    	elm_object_text_set(ad->label1, buf);
+    }
+    last_z=current_z;
+}
+
+
+
+
+//opt
+static float last_z=0;
+//counter of recorded value gyroscope
+static int counter_a=0;
+static int pressed=0;
+static int record=0;
+//d_gz = a(x0+T)-a(x0) where T is the sampling period so,a(x0+T)=a(x1)
+static float d_gz=0;//derivative
+
+static void
+create_base_gui(appdata_s *ad)
+{
+	/* Window */
+	/* Create and initialize elm_win.
+	   elm_win is mandatory to manipulate window. */
+	ad->win = elm_win_util_standard_add(PACKAGE, PACKAGE);
+	elm_win_autodel_set(ad->win, EINA_TRUE);
+
+	if (elm_win_wm_rotation_supported_get(ad->win)) {
+		int rots[4] = { 0, 90, 180, 270 };
+		elm_win_wm_rotation_available_rotations_set(ad->win, (const int *)(&rots), 4);
+	}
+
+	evas_object_smart_callback_add(ad->win, "delete,request", win_delete_request_cb, NULL);
+	eext_object_event_callback_add(ad->win, EEXT_CALLBACK_BACK, win_back_cb, ad);
+
+	/* Conformant */
+	/*
+	   Create and initialize elm_conformant
+	   elm_conformant is mandatory for the base GUI to have a proper size
+	   when the indicator or virtual keypad is visible
+	*/
+	ad->conform = elm_conformant_add(ad->win);
+	elm_win_indicator_mode_set(ad->win, ELM_WIN_INDICATOR_SHOW);
+	elm_win_indicator_opacity_set(ad->win, ELM_WIN_INDICATOR_OPAQUE);
+	evas_object_size_hint_weight_set(ad->conform, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
+	elm_win_resize_object_add(ad->win, ad->conform);
+	evas_object_show(ad->conform);
+
+	/* Box can contain other elements in a vertical line (by default) */
+	Evas_Object *box = elm_box_add(ad->win);
+	evas_object_size_hint_weight_set(box, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
+	evas_object_size_hint_align_set(box, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
+	elm_object_content_set(ad->conform, box);
+	evas_object_show(box);
+
+	/* First label (for the sensor support) */
+	ad->label0 = elm_label_add(ad->conform);
+	elm_object_text_set(ad->label0, "-");
+	my_box_pack(box, ad->label0, 1.5, 0.0, -1.0, -1.0);
+
+	/* Second label (for the current acceleration value) */
+	ad->label1 = elm_label_add(ad->conform);
+	elm_object_text_set(ad->label1, "");
+	my_box_pack(box, ad->label1, 1.0, 1.0, -1.0, -1.0);
+
+	/* Button */
+	//Evas_Object *btn = elm_button_add(ad->conform);
+	//elm_object_text_set(btn, "REC");
+	//evas_object_smart_callback_add(btn, "clicked", btn_clicked_init_max_acc_value, ad);
+	//my_box_pack(box, btn, 1.0, 0.0, -1.0, -1.0);
+
+	/* Third label (for the maximum value) */
+	ad->label2 = elm_label_add(ad->conform);
+	elm_object_text_set(ad->label2, "-");
+	my_box_pack(box, ad->label2, 1.0, 1.0, 0.5, -1.0);
+
+	/* Show the window after the base GUI is set up */
+	evas_object_show(ad->win);
+
+	/* Check the sensor support */
+	//show_is_supported(ad);
+}
+
+
+static bool
+app_create(void *data)
+{
+	/* Hook to take necessary actions before main event loop starts
+		Initialize UI resources and application's data
+		If this function returns true, the main loop of application starts
+		If this function returns false, the application is terminated */
+	appdata_s *ad = data;
+	create_base_gui(ad);
+
+	 int error_code = 0;
+	    char buf[PATH_MAX];
+
+	error_code = player_create(&ad->player);
+
+		    if (error_code != PLAYER_ERROR_NONE)
+		    	{
+		    	elm_object_text_set(ad->label2,"failed to create");
+
+		    	}
+
+		    //set the audio file path
+		    error_code = player_set_uri(ad->player,"file:///opt/usr/media/Music/snare.mp3");
+		    if (error_code != PLAYER_ERROR_NONE)
+		       	elm_object_text_set(ad->label2,"file location error");
+
+		    //player in "ready" state
+		   error_code = player_prepare(ad->player);
+		   if (error_code != PLAYER_ERROR_NONE){
+		  	sprintf(buf, "error code %d",error_code);
+		  	elm_object_text_set(ad->label2,buf);
+		  }
+
+
+
+	return true;
+}
+
+static void
+app_control(app_control_h app_control, void *data)
+{
+	/* Handle the launch request. */
+}
+
+static void
+app_pause(void *data)
+{
+
+	/* Take necessary actions when application becomes invisible. */
+	appdata_s *ad = data;
+	stop_accelerator_sensor(ad);
+}
+
+static void
+app_resume(void *data)
+{
+	/* Take necessary actions when application becomes visible. */
+	appdata_s *ad = data;
+	start_gyroscope_sensor(ad,gf_interval);
+}
+
+static void
+app_terminate(void *data)
+{
+	appdata_s *ad = data;
+	stop_gyroscope_sensor(ad);
+}
+
+static void
+ui_app_lang_changed(app_event_info_h event_info, void *user_data)
+{
+	/*APP_EVENT_LANGUAGE_CHANGED*/
+	char *locale = NULL;
+	system_settings_get_value_string(SYSTEM_SETTINGS_KEY_LOCALE_LANGUAGE, &locale);
+	elm_language_set(locale);
+	free(locale);
+	return;
+}
+
+static void
+ui_app_orient_changed(app_event_info_h event_info, void *user_data)
+{
+	/*APP_EVENT_DEVICE_ORIENTATION_CHANGED*/
+	return;
+}
+
+static void
+ui_app_region_changed(app_event_info_h event_info, void *user_data)
+{
+	/*APP_EVENT_REGION_FORMAT_CHANGED*/
+}
+
+static void
+ui_app_low_battery(app_event_info_h event_info, void *user_data)
+{
+	/*APP_EVENT_LOW_BATTERY*/
+}
+
+static void
+ui_app_low_memory(app_event_info_h event_info, void *user_data)
+{
+	/*APP_EVENT_LOW_MEMORY*/
+}
+
+int
+main(int argc, char *argv[])
+{
+	appdata_s ad = {0,};
+	int ret = 0;
+
+	ui_app_lifecycle_callback_s event_callback = {0,};
+	app_event_handler_h handlers[5] = {NULL, };
+
+	event_callback.create = app_create;
+	event_callback.terminate = app_terminate;
+	event_callback.pause = app_pause;
+	event_callback.resume = app_resume;
+	event_callback.app_control = app_control;
+
+	ui_app_add_event_handler(&handlers[APP_EVENT_LOW_BATTERY], APP_EVENT_LOW_BATTERY, ui_app_low_battery, &ad);
+	ui_app_add_event_handler(&handlers[APP_EVENT_LOW_MEMORY], APP_EVENT_LOW_MEMORY, ui_app_low_memory, &ad);
+	ui_app_add_event_handler(&handlers[APP_EVENT_DEVICE_ORIENTATION_CHANGED], APP_EVENT_DEVICE_ORIENTATION_CHANGED, ui_app_orient_changed, &ad);
+	ui_app_add_event_handler(&handlers[APP_EVENT_LANGUAGE_CHANGED], APP_EVENT_LANGUAGE_CHANGED, ui_app_lang_changed, &ad);
+	ui_app_add_event_handler(&handlers[APP_EVENT_REGION_FORMAT_CHANGED], APP_EVENT_REGION_FORMAT_CHANGED, ui_app_region_changed, &ad);
+
+	ret = ui_app_main(argc, argv, &event_callback, &ad);
+	if (ret != APP_ERROR_NONE) {
+		dlog_print(DLOG_ERROR, LOG_TAG, "app_main() is failed. err = %d", ret);
+	}
+
+	return ret;
+}
